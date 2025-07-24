@@ -1,99 +1,91 @@
-from flask import Flask, render_template, request, send_file, redirect, url_for
+# app.py
+from flask import Flask, render_template, request, redirect, send_file
 from PyPDF2 import PdfReader, PdfWriter
+import os
+import io
+import pandas as pd
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import letter
-import pandas as pd
-import io
-import re
-import unicodedata
-import zipfile
 
-def create_app():
-    app = Flask(__name__)
+app = Flask(__name__)
 
-    def clean_filename(name):
-        name = unicodedata.normalize('NFKD', name).encode('ascii', 'ignore').decode()
-        name = re.sub(r'[^\w\-\s\.]', '', name)
-        name = name.replace(' ', '_')
-        return name[:100]
+UPLOAD_FOLDER = 'uploads'
+OUTPUT_FOLDER = 'output'
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
-    def extract_checklist_titles(pages_text):
-        titles = []
-        for i, text in enumerate(pages_text):
-            if all(field in text for field in ["ID", "Name", "Description", "Company", "Checklist Status"]):
-                match = re.search(
-                    r"Name\s*[:\-]?\s*(.*?)\n(?=(ID|Description|Author|Created On|Tags|Custom Properties|Company|Priority|Status|Location|Equipment Name|Equipment Barcode))",
-                    text, re.IGNORECASE | re.DOTALL
-                )
-                if match:
-                    raw_title = match.group(1).strip()
-                    raw_title = re.sub(
-                        r"\s*(ID|Description|Author|Created On|Tags|Custom Properties|Company|Priority|Status|Location|Equipment Name|Equipment Barcode)\s*:?.*",
-                        "", raw_title, flags=re.IGNORECASE)
-                    titles.append((i, raw_title))
-        return titles
+def extract_checklist_ranges(pdf_reader):
+    checklist_ranges = []
+    for i, page in enumerate(pdf_reader.pages):
+        text = page.extract_text()
+        if not text:
+            continue
+        if 'Checklist:' in text:
+            checklist_name = text.split('Checklist:')[1].split('\n')[0].strip()
+            checklist_ranges.append({'Checklist Name': checklist_name, 'Start Page': i})
 
-    def overlay_white_footer(page):
-        packet = io.BytesIO()
-        width = float(page.mediabox.width)
-        height = float(page.mediabox.height)
-        can = canvas.Canvas(packet, pagesize=(width, height))
-        can.setFillColorRGB(1, 1, 1)
-        can.rect(0, 0, width, 90, fill=True, stroke=False)
-        can.save()
-        packet.seek(0)
-        overlay_pdf = PdfReader(packet)
-        overlay_page = overlay_pdf.pages[0]
-        page.merge_page(overlay_page)
-        return page
+    for i in range(len(checklist_ranges)):
+        if i + 1 < len(checklist_ranges):
+            checklist_ranges[i]['End Page'] = checklist_ranges[i+1]['Start Page'] - 1
+        else:
+            checklist_ranges[i]['End Page'] = len(pdf_reader.pages) - 1
+    return checklist_ranges
 
-    @app.route('/')
-    def home():
-        return render_template('index.html')
+def split_pdf(input_path, checklist_ranges):
+    pdf_reader = PdfReader(input_path)
+    for checklist in checklist_ranges:
+        pdf_writer = PdfWriter()
+        for i in range(checklist['Start Page'], checklist['End Page'] + 1):
+            pdf_writer.add_page(pdf_reader.pages[i])
 
-    @app.route('/checklist-splitter', methods=['GET', 'POST'])
-    def checklist_splitter():
-        if request.method == 'POST':
-            file = request.files.get('pdf')
-            if not file:
-                return redirect(url_for('checklist_splitter'))
+        safe_name = checklist['Checklist Name'].replace(' ', '_').replace('/', '_')
+        output_filename = f"{safe_name}.pdf"
+        output_path = os.path.join(OUTPUT_FOLDER, output_filename)
+        with open(output_path, 'wb') as f:
+            pdf_writer.write(f)
 
-            file_bytes = file.read()
-            pdf_reader = PdfReader(io.BytesIO(file_bytes))
-            pages_text = [page.extract_text() or "" for page in pdf_reader.pages]
-            checklist_titles = extract_checklist_titles(pages_text)
+def save_summary_pdf(checklist_ranges):
+    buffer = io.BytesIO()
+    c = canvas.Canvas(buffer, pagesize=letter)
+    textobject = c.beginText(50, 750)
+    textobject.setFont("Helvetica", 12)
+    textobject.textLine("Checklist Summary")
+    textobject.moveCursor(0, 20)
 
-            if not checklist_titles:
-                return render_template('index.html', summary=None, error="No checklists found.")
+    for item in checklist_ranges:
+        line = f"{item['Checklist Name']}: Pages {item['Start Page'] + 1} - {item['End Page'] + 1}"
+        textobject.textLine(line)
+        textobject.moveCursor(0, 15)
 
-            start_indices = [idx for idx, _ in checklist_titles]
-            end_indices = start_indices[1:] + [len(pages_text)]
-            checklist_groups = [
-                {"title": clean_filename(title), "start": start, "end": end}
-                for (start, title), end in zip(checklist_titles, end_indices)
-            ]
+    c.drawText(textobject)
+    c.showPage()
+    c.save()
+    buffer.seek(0)
+    return buffer
 
-            summary_data = []
-            zip_buffer = io.BytesIO()
-            with zipfile.ZipFile(zip_buffer, "w") as zipf:
-                for group in checklist_groups:
-                    writer = PdfWriter()
-                    for p in range(group["start"], group["end"]):
-                        cleaned_page = overlay_white_footer(pdf_reader.pages[p])
-                        writer.add_page(cleaned_page)
-                    pdf_output = io.BytesIO()
-                    writer.write(pdf_output)
-                    filename = f"{group['title']}.pdf"
-                    zipf.writestr(filename, pdf_output.getvalue())
-                    summary_data.append({"Checklist Name": group['title'], "Start Page": group['start']+1, "End Page": group['end']})
+@app.route('/', methods=['GET', 'POST'])
+def index():
+    summary = None
+    error = None
 
-            zip_buffer.seek(0)
-            return send_file(zip_buffer, download_name="Checklist_Split.zip", as_attachment=True)
+    if request.method == 'POST':
+        file = request.files.get('pdf')
+        if not file:
+            error = 'No file uploaded'
+            return render_template('index.html', error=error)
 
-        return render_template('index.html', summary=None, error=None)
+        input_path = os.path.join(UPLOAD_FOLDER, file.filename)
+        file.save(input_path)
 
-    return app
+        try:
+            pdf_reader = PdfReader(input_path)
+            checklist_ranges = extract_checklist_ranges(pdf_reader)
+            split_pdf(input_path, checklist_ranges)
+            summary = checklist_ranges
+        except Exception as e:
+            error = str(e)
+
+    return render_template('index.html', summary=summary, error=error)
 
 if __name__ == '__main__':
-    app = create_app()
-    app.run(debug=False, host='0.0.0.0', port=10000)
+    app.run(debug=True)
